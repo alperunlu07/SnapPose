@@ -1,0 +1,28 @@
+{
+  "name": "com.playfinitygames.snappose",
+  "version": "1.0.0",
+  "displayName": "SnapPose",
+  "description": "A Unity Editor tool for capturing, composing, and applying bone poses from animation clips. Designed for VFX artists, animators, and technical artists who need precise control over character idle positions.",
+  "unity": "2021.3",
+  "keywords": [
+    "animation",
+    "pose",
+    "editor",
+    "tools",
+    "vfx",
+    "bones",
+    "rig",
+    "character"
+  ],
+  "author": {
+    "name": "Playfinity Games",
+    "url": "https://github.com/alperunlu07"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alperunlu07/SnapPose.git"
+  },
+  "license": "MIT",
+  "documentationUrl": "https://github.com/alperunlu07/SnapPose/blob/main/README.md",
+  "changelogUrl": "https://github.com/alperunlu07/SnapPose/blob/main/CHANGELOG.md"
+}

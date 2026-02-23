@@ -1,0 +1,16 @@
+# Exclude test data and sample pose files
+*.asset
+*.asset.meta
+MyPoseLibrary.asset*
+*Frame*.asset*
+
+# Temporary files
+nul
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Exclude .gitignore.meta only (package.json.meta is now included)
+.gitignore.meta
