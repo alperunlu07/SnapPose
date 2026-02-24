@@ -10,7 +10,8 @@ namespace SnapPose.Editor.UI
     public class WorkspacePanel : VisualElement
     {
         readonly SnapPoseController    _ctrl;
-        readonly List<GameObject>      _objects    = new List<GameObject>();
+        readonly List<GameObject>      _objects     = new List<GameObject>();
+        readonly List<Button>          _playButtons = new List<Button>();
         int                            _selectedIdx = -1;
 
         VisualElement _listContainer;
@@ -19,6 +20,15 @@ namespace SnapPose.Editor.UI
         public WorkspacePanel(SnapPoseController ctrl)
         {
             _ctrl = ctrl;
+            _ctrl.OnPreviewChanged += UpdatePlayButtons;
+            RegisterCallback<AttachToPanelEvent>(_ =>
+                EditorApplication.hierarchyChanged += CleanupDestroyedObjects);
+            RegisterCallback<DetachFromPanelEvent>(_ =>
+            {
+                _ctrl.OnPreviewChanged -= UpdatePlayButtons;
+                EditorApplication.hierarchyChanged -= CleanupDestroyedObjects;
+            });
+
             style.flexDirection = FlexDirection.Column;
             style.flexGrow      = 1;
 
@@ -125,6 +135,7 @@ namespace SnapPose.Editor.UI
         void RemoveObject(int idx)
         {
             if (idx < 0 || idx >= _objects.Count) return;
+            _ctrl.OnObjectRemoved(_objects[idx]);
             _objects.RemoveAt(idx);
             if (_selectedIdx >= _objects.Count) _selectedIdx = _objects.Count - 1;
             RebuildList();
@@ -134,10 +145,37 @@ namespace SnapPose.Editor.UI
 
         void ClearAll()
         {
+            foreach (var go in _objects)
+                _ctrl.OnObjectRemoved(go);
             _objects.Clear();
             _selectedIdx = -1;
             _ctrl.SetTarget(null);
             RebuildList();
+        }
+
+        /// <summary>
+        /// Called whenever the scene hierarchy changes. Removes any workspace entries whose
+        /// GameObjects have been destroyed in the scene so animations don't keep playing on
+        /// deleted objects.
+        /// </summary>
+        void CleanupDestroyedObjects()
+        {
+            bool changed = false;
+            for (int i = _objects.Count - 1; i >= 0; i--)
+            {
+                if (_objects[i] != null) continue;
+                _objects.RemoveAt(i);
+                if      (_selectedIdx > i)  _selectedIdx--;
+                else if (_selectedIdx == i) _selectedIdx = Mathf.Clamp(_selectedIdx, 0, _objects.Count - 1);
+                changed = true;
+            }
+            if (!changed) return;
+
+            // _globalPlayEntries null-entries are cleaned up inside OnEditorUpdate automatically.
+            RebuildList();
+            var newTarget = (_selectedIdx >= 0 && _selectedIdx < _objects.Count)
+                ? _objects[_selectedIdx] : null;
+            _ctrl.SetTarget(newTarget);
         }
 
         void SelectObject(int idx)
@@ -150,6 +188,7 @@ namespace SnapPose.Editor.UI
         void RebuildList()
         {
             _listContainer.Clear();
+            _playButtons.Clear();
             _emptyLabel.style.display = _objects.Count == 0 ? DisplayStyle.Flex : DisplayStyle.None;
             _listContainer.Add(_emptyLabel);
 
@@ -191,12 +230,61 @@ namespace SnapPose.Editor.UI
                 col.Add(nameRow);
                 item.Add(col);
 
+                // Play / Pause button
+                bool playing = _ctrl.GetSavedIsPlaying(go);
+                var playBtn = SnapPoseStyles.MakeIconButton(
+                    playing ? "⏸" : "▶",
+                    () => OnPlayPauseClicked(localIdx),
+                    playing ? "Pause animation" : "Play animation");
+                playBtn.RegisterCallback<ClickEvent>(evt => evt.StopPropagation());
+                _playButtons.Add(playBtn);
+                item.Add(playBtn);
+
                 // Remove button
                 var rmBtn = SnapPoseStyles.MakeIconButton("✕", () => RemoveObject(localIdx), "Remove");
+                rmBtn.RegisterCallback<ClickEvent>(evt => evt.StopPropagation());
                 item.Add(rmBtn);
 
                 item.RegisterCallback<ClickEvent>(_ => SelectObject(localIdx));
                 _listContainer.Add(item);
+            }
+        }
+
+        // ── Play / Pause ──────────────────────────────────────────────────────
+        void UpdatePlayButtons()
+        {
+            for (int i = 0; i < _playButtons.Count && i < _objects.Count; i++)
+            {
+                bool playing = _ctrl.GetSavedIsPlaying(_objects[i]);
+                _playButtons[i].text    = playing ? "⏸" : "▶";
+                _playButtons[i].tooltip = playing ? "Pause animation" : "Play animation";
+            }
+        }
+
+        void OnPlayPauseClicked(int idx)
+        {
+            var go      = _objects[idx];
+            bool playing = _ctrl.GetSavedIsPlaying(go);
+
+            if (playing)
+            {
+                if (idx == _selectedIdx)
+                    _ctrl.StopPlayback();
+                else
+                {
+                    // Object is not active — just clear its saved playing flag
+                    _ctrl.ClearSavedPlayingState(go);
+                    UpdatePlayButtons();
+                }
+            }
+            else
+            {
+                // Select the object if needed (SetTarget will auto-resume if it was playing,
+                // but since playing=false here it won't — we start it explicitly below)
+                if (idx != _selectedIdx)
+                    SelectObject(idx);
+                if (!_ctrl.IsPlaying)
+                    _ctrl.StartPlayback();
             }
         }
 

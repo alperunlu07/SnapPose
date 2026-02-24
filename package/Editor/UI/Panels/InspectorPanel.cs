@@ -37,10 +37,8 @@ namespace SnapPose.Editor.UI
         // Mirror panel
         MirrorSetupPanel _mirrorPanel;
 
-        // Apply state
-        ApplyMode          _applyMode = ApplyMode.Permanent;
-        BoneMask           _boneMask  = new BoneMask();
         BoneMaskEditorPanel _maskEditor;
+        Label               _modeHintLabel;
 
         public InspectorPanel(SnapPoseController ctrl)
         {
@@ -112,7 +110,7 @@ namespace SnapPose.Editor.UI
             _timeline.OnPlayPauseClicked += () =>
             {
                 if (_ctrl.IsPlaying) _ctrl.StopPlayback();
-                else                 _ctrl.StartPlayback(_boneMask);
+                else                 _ctrl.StartPlayback(_ctrl.ActiveMask);
             };
             timelineCard.Add(_timeline);
 
@@ -162,14 +160,17 @@ namespace SnapPose.Editor.UI
             _blendLabel.AddToClassList("snap-label-accent");
             _blendLabel.style.minWidth = 36;
             _blendSlider.RegisterValueChangedCallback(e =>
-                _blendLabel.text = $"{(int)(e.newValue * 100)}%");
+            {
+                _ctrl.ActiveBlendWeight = e.newValue;
+                _blendLabel.text = $"{(int)(e.newValue * 100)}%";
+            });
             blendRow.Add(_blendLabel);
             blendCard.Add(blendRow);
             inner.Add(blendCard);
 
             // ── Bone Mask ──────────────────────────────────────────────────
             var boneMaskSection = new CollapsibleSection("BONE MASK", "🦴", defaultExpanded: true);
-            _maskEditor = new BoneMaskEditorPanel(_ctrl, _boneMask);
+            _maskEditor = new BoneMaskEditorPanel(_ctrl, _ctrl.ActiveMask);
             var maskCard = SnapPoseStyles.MakeCard();
             maskCard.Add(_maskEditor);
             boneMaskSection.AddContent(maskCard);
@@ -236,13 +237,13 @@ namespace SnapPose.Editor.UI
             _radioPermanent.RegisterValueChangedCallback(e =>
             {
                 if (!e.newValue) return;
-                _applyMode = ApplyMode.Permanent;
+                _ctrl.ActiveApplyMode = ApplyMode.Permanent;
                 RefreshApplyButton();
             });
             _radioPreview.RegisterValueChangedCallback(e =>
             {
                 if (!e.newValue) return;
-                _applyMode = ApplyMode.Preview;
+                _ctrl.ActiveApplyMode = ApplyMode.Preview;
                 RefreshApplyButton();
             });
 
@@ -258,23 +259,23 @@ namespace SnapPose.Editor.UI
             actionBar.Add(modeRow);
 
             // Mode description hint
-            var modeHint = new Label();
-            modeHint.AddToClassList("snap-label-secondary");
-            modeHint.style.marginBottom  = 6;
-            modeHint.style.whiteSpace    = WhiteSpace.Normal;
-            modeHint.style.fontSize      = 9;
+            _modeHintLabel = new Label();
+            _modeHintLabel.AddToClassList("snap-label-secondary");
+            _modeHintLabel.style.marginBottom  = 6;
+            _modeHintLabel.style.whiteSpace    = WhiteSpace.Normal;
+            _modeHintLabel.style.fontSize      = 9;
             // Update hint when mode changes
             void UpdateModeHint()
             {
-                if (_applyMode == ApplyMode.Permanent)
-                    modeHint.text = "Writes transforms permanently. Ctrl+Z to undo.";
+                if (_ctrl.ActiveApplyMode == ApplyMode.Permanent)
+                    _modeHintLabel.text = "Writes transforms permanently. Ctrl+Z to undo.";
                 else
-                    modeHint.text = "Pose shown in Scene view only — no permanent changes. Stop Preview to revert.";
+                    _modeHintLabel.text = "Pose shown in Scene view only — no permanent changes. Stop Preview to revert.";
             }
             _radioPermanent.RegisterValueChangedCallback(_ => UpdateModeHint());
             _radioPreview.RegisterValueChangedCallback(_ => UpdateModeHint());
             UpdateModeHint();
-            actionBar.Add(modeHint);
+            actionBar.Add(_modeHintLabel);
 
             // ── Buttons row ────────────────────────────────────────────────────
             var btnRow = new VisualElement
@@ -282,10 +283,10 @@ namespace SnapPose.Editor.UI
 
             _sampleBtn = SnapPoseStyles.MakeSecondaryButton("📷 Sample", () =>
             {
-                var pose = _ctrl.SampleCurrentPose(_boneMask);
+                var pose = _ctrl.SampleCurrentPose(_ctrl.ActiveMask);
                 if (pose != null)
                 {
-                    _ctrl.ComputeAndPublishDiff(pose, _boneMask);
+                    _ctrl.ComputeAndPublishDiff(pose, _ctrl.ActiveMask);
                     _ctrl.AddLayer(pose);
                 }
             });
@@ -295,7 +296,7 @@ namespace SnapPose.Editor.UI
 
             _saveBtn = SnapPoseStyles.MakeSecondaryButton("💾 Save Pose", () =>
             {
-                var pose = _ctrl.SampleCurrentPose(_boneMask);
+                var pose = _ctrl.SampleCurrentPose(_ctrl.ActiveMask);
                 if (pose != null) _ctrl.SavePoseToLibrary(pose);
             });
             _saveBtn.style.flexGrow = 1;
@@ -305,7 +306,7 @@ namespace SnapPose.Editor.UI
 
             _applyBtn = SnapPoseStyles.MakePrimaryButton("⚡ APPLY POSE", () =>
             {
-                _ctrl.ApplyCurrentPose(_boneMask, _blendSlider.value, _applyMode);
+                _ctrl.ApplyCurrentPose(_ctrl.ActiveMask, _blendSlider.value, _ctrl.ActiveApplyMode);
             });
             _applyBtn.style.marginTop = 6;
             actionBar.Add(_applyBtn);
@@ -313,8 +314,8 @@ namespace SnapPose.Editor.UI
             // Diff pre-check
             var diffCheckBtn = SnapPoseStyles.MakeSecondaryButton("⊕ Preview Changes (Diff)", () =>
             {
-                var pose = _ctrl.SampleCurrentPose(_boneMask);
-                if (pose != null) _ctrl.ComputeAndPublishDiff(pose, _boneMask);
+                var pose = _ctrl.SampleCurrentPose(_ctrl.ActiveMask);
+                if (pose != null) _ctrl.ComputeAndPublishDiff(pose, _ctrl.ActiveMask);
             });
             diffCheckBtn.style.marginTop = 4;
             actionBar.Add(diffCheckBtn);
@@ -340,6 +341,18 @@ namespace SnapPose.Editor.UI
                 _targetLabel.style.color = SnapPoseStyles.TextDisabled;
             }
 
+            // Sync all per-object UI state from controller (restores settings after workspace switch)
+            _clipField.SetValueWithoutNotify(_ctrl.SelectedClip);
+            _timeline.SetClip(_ctrl.SelectedClip);
+            _blendSlider.SetValueWithoutNotify(_ctrl.ActiveBlendWeight);
+            _blendLabel.text = $"{(int)(_ctrl.ActiveBlendWeight * 100)}%";
+            _radioPermanent.SetValueWithoutNotify(_ctrl.ActiveApplyMode == ApplyMode.Permanent);
+            _radioPreview.SetValueWithoutNotify(_ctrl.ActiveApplyMode == ApplyMode.Preview);
+            _modeHintLabel.text = _ctrl.ActiveApplyMode == ApplyMode.Permanent
+                ? "Writes transforms permanently. Ctrl+Z to undo."
+                : "Pose shown in Scene view only — no permanent changes. Stop Preview to revert.";
+            _maskEditor.SetMask(_ctrl.ActiveMask);
+
             _applyBtn.SetEnabled(hasTarget && hasClip);
             _sampleBtn.SetEnabled(hasTarget && hasClip);
             _saveBtn.SetEnabled(hasTarget && hasClip);
@@ -350,7 +363,7 @@ namespace SnapPose.Editor.UI
 
         void RefreshApplyButton()
         {
-            if (_applyMode == ApplyMode.Preview)
+            if (_ctrl.ActiveApplyMode == ApplyMode.Preview)
             {
                 _applyBtn.text = "👁 PREVIEW POSE";
                 _applyBtn.tooltip = "Enters AnimationMode — pose is shown in Scene view only. Stop Preview to revert.";
@@ -398,7 +411,7 @@ namespace SnapPose.Editor.UI
         void TogglePreview()
         {
             if (_ctrl.IsPreviewActive) _ctrl.StopPreview();
-            else _ctrl.StartPreview(_boneMask);
+            else _ctrl.StartPreview(_ctrl.ActiveMask);
         }
     }
 }

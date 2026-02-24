@@ -30,7 +30,7 @@ namespace SnapPose.Editor
 
         void OnDisable()
         {
-            _ctrl?.StopPreview();
+            _ctrl?.StopAll(); // stops ALL playing objects + AnimationMode when window closes
         }
 
         void CreateGUI()

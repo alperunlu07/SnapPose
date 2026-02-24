@@ -28,6 +28,11 @@ namespace SnapPose.Editor
         public PoseData      LastSampledPose { get; private set; }
         public PoseLibrary   ActiveLibrary  { get; set; }
 
+        // Per-object inspector state — saved and restored when switching workspace objects
+        public BoneMask  ActiveMask        { get; set; } = new BoneMask();
+        public float     ActiveBlendWeight { get; set; } = 1f;
+        public ApplyMode ActiveApplyMode   { get; set; } = ApplyMode.Permanent;
+
         double _lastEditorTime;
 
         // Mask + rest-pose snapshot for masked playback/preview
@@ -46,12 +51,178 @@ namespace SnapPose.Editor
             public System.DateTime timestamp;
         }
 
+        sealed class PerObjectState
+        {
+            public AnimationClip         Clip;
+            public float                 Time;
+            public float                 Speed;
+            public BoneMask              Mask;
+            public float                 BlendWeight;
+            public ApplyMode             ApplyMode;
+            public List<PoseLayerConfig> Stack;
+            public List<HistoryEntry>    History;
+            public bool                  IsPlaying;
+        }
+
+        readonly Dictionary<int, PerObjectState> _objectStates = new Dictionary<int, PerObjectState>();
+
+        // ── Global multi-object playback ──────────────────────────────────────
+        // All objects currently playing, independent of which one is "selected".
+        // A single EditorApplication.update loop samples all of them each frame.
+        class GlobalPlayEntry
+        {
+            public GameObject    Go;
+            public AnimationClip Clip;
+            public float         Time;
+            public float         Speed;
+        }
+
+        readonly List<GlobalPlayEntry> _globalPlayEntries  = new List<GlobalPlayEntry>();
+        bool                           _globalUpdateRunning = false;
+
         // ── Target ───────────────────────────────────────────────────────────
         public void SetTarget(GameObject go)
         {
-            StopPreview();
+            // Capture BEFORE any change so IsPlaying=true is preserved in the snapshot
+            var stateToSave = TargetObject != null ? CaptureState() : null;
+
+            // Keep outgoing object in the global playback list (it keeps animating in background).
+            // Only stop scrubbing-only preview (not playing) for the outgoing target.
+            if (IsPreviewActive && !IsPlaying)
+            {
+                // Was scrubbing but not playing — clear scrub state.
+                // Don't call StopPreview: AnimationMode may still be needed for background objects.
+                IsPreviewActive = false;
+                _previewMask    = null;
+                _restPose       = null;
+                if (_globalPlayEntries.Count == 0)
+                {
+                    if (_globalUpdateRunning)
+                    {
+                        _globalUpdateRunning = false;
+                        EditorApplication.update -= OnEditorUpdate;
+                    }
+                    PoseSampler.StopPreview();
+                }
+            }
+
+            // Sync speed on the outgoing entry in case PlaybackSpeed changed
+            if (IsPlaying && TargetObject != null)
+            {
+                var outEntry = _globalPlayEntries.Find(e => e.Go == TargetObject);
+                if (outEntry != null) outEntry.Speed = PlaybackSpeed;
+            }
+
+            // Save outgoing state
+            if (stateToSave != null)
+                _objectStates[TargetObject.GetInstanceID()] = stateToSave;
+
+            // Reset active-target flags (not the global list)
+            IsPlaying       = false;
+            IsPreviewActive = false;
+            _previewMask    = null;
+            _restPose       = null;
+
             TargetObject = go;
+
+            if (go != null && _objectStates.TryGetValue(go.GetInstanceID(), out var saved))
+            {
+                ApplyState(saved);
+
+                // If this object is already playing in the background, sync its live time
+                var liveEntry = _globalPlayEntries.Find(e => e.Go == go);
+                if (liveEntry != null)
+                {
+                    CurrentTime     = liveEntry.Time;
+                    IsPlaying       = true;
+                    IsPreviewActive = true;
+                }
+                else if (saved.IsPlaying && SelectedClip != null)
+                {
+                    // Was playing before; add it to the global list now
+                    StartPlayback(ActiveMask);
+                }
+            }
+            else
+            {
+                ResetState();
+            }
+
             NotifyStateChanged();
+        }
+
+        PerObjectState CaptureState() => new PerObjectState
+        {
+            Clip        = SelectedClip,
+            Time        = CurrentTime,
+            Speed       = PlaybackSpeed,
+            Mask        = ActiveMask.Clone(),
+            BlendWeight = ActiveBlendWeight,
+            ApplyMode   = ActiveApplyMode,
+            Stack       = new List<PoseLayerConfig>(PoseStack),
+            History     = new List<HistoryEntry>(History),
+            IsPlaying   = IsPlaying
+        };
+
+        void ApplyState(PerObjectState s)
+        {
+            SelectedClip      = s.Clip;
+            CurrentTime       = s.Time;
+            PlaybackSpeed     = s.Speed;
+            ActiveMask        = s.Mask.Clone();
+            ActiveBlendWeight = s.BlendWeight;
+            ActiveApplyMode   = s.ApplyMode;
+            PoseStack.Clear(); PoseStack.AddRange(s.Stack);
+            History.Clear();   History.AddRange(s.History);
+        }
+
+        void ResetState()
+        {
+            SelectedClip      = null;
+            CurrentTime       = 0f;
+            PlaybackSpeed     = 1f;
+            ActiveMask        = new BoneMask();
+            ActiveBlendWeight = 1f;
+            ActiveApplyMode   = ApplyMode.Permanent;
+            PoseStack.Clear();
+            History.Clear();
+        }
+
+        /// <summary>Returns true if the object is currently playing (active or background).</summary>
+        public bool GetSavedIsPlaying(GameObject go)
+        {
+            if (go == null) return false;
+            if (go == TargetObject) return IsPlaying;
+            // Check live global entries first (object may be actively animating in background)
+            if (_globalPlayEntries.Exists(e => e.Go == go)) return true;
+            return _objectStates.TryGetValue(go.GetInstanceID(), out var s) && s.IsPlaying;
+        }
+
+        /// <summary>Stops and clears the playing state for any object (active or background).</summary>
+        public void ClearSavedPlayingState(GameObject go)
+        {
+            if (go == null) return;
+            bool wasActiveTarget = go == TargetObject;
+            _globalPlayEntries.RemoveAll(e => e.Go == go);
+            if (wasActiveTarget) IsPlaying = false;
+            if (_objectStates.TryGetValue(go.GetInstanceID(), out var s))
+                s.IsPlaying = false;
+            // Stop the update loop if nothing is playing anymore
+            if (_globalPlayEntries.Count == 0 && _globalUpdateRunning)
+            {
+                _globalUpdateRunning = false;
+                EditorApplication.update -= OnEditorUpdate;
+                if (!IsPreviewActive && AnimationMode.InAnimationMode())
+                    PoseSampler.StopPreview();
+            }
+        }
+
+        /// <summary>Called by WorkspacePanel when an object is removed; cleans up all playback state.</summary>
+        public void OnObjectRemoved(GameObject go)
+        {
+            if (go == null) return;
+            ClearSavedPlayingState(go);
+            _objectStates.Remove(go.GetInstanceID());
         }
 
         // ── Clip / Time ───────────────────────────────────────────────────────
@@ -96,17 +267,36 @@ namespace SnapPose.Editor
 
             IsPreviewActive = true;
             PoseSampler.StartPreview(TargetObject, SelectedClip, CurrentTime);
+
+            // Start the global update loop so the scrubbing target is re-sampled inside every
+            // BeginSampling/EndSampling batch — otherwise background playback batches erase its pose.
+            _lastEditorTime = EditorApplication.timeSinceStartup;
+            if (!_globalUpdateRunning)
+            {
+                _globalUpdateRunning = true;
+                EditorApplication.update += OnEditorUpdate;
+            }
+
             OnPreviewChanged?.Invoke();
         }
 
         public void StopPreview()
         {
-            StopPlayback();
+            StopPlayback(); // removes active target from global list if playing
             if (!IsPreviewActive) return;
             IsPreviewActive = false;
             _previewMask    = null;
             _restPose       = null;
-            PoseSampler.StopPreview();
+            // Only stop AnimationMode and the update loop when no other objects are playing
+            if (_globalPlayEntries.Count == 0)
+            {
+                if (_globalUpdateRunning)
+                {
+                    _globalUpdateRunning = false;
+                    EditorApplication.update -= OnEditorUpdate;
+                }
+                PoseSampler.StopPreview();
+            }
             OnPreviewChanged?.Invoke();
         }
 
@@ -121,26 +311,111 @@ namespace SnapPose.Editor
                 PoseSampler.UpdatePreview(TargetObject, SelectedClip, CurrentTime);
         }
 
+        // ── Stop all ─────────────────────────────────────────────────────────
+        /// <summary>Stops every playing object and exits AnimationMode entirely.
+        /// Call this when the tool window closes so nothing leaks into the editor.</summary>
+        public void StopAll()
+        {
+            _globalPlayEntries.Clear();
+            IsPlaying       = false;
+            IsPreviewActive = false;
+            _previewMask    = null;
+            _restPose       = null;
+            if (_globalUpdateRunning)
+            {
+                _globalUpdateRunning = false;
+                EditorApplication.update -= OnEditorUpdate;
+            }
+            PoseSampler.StopPreview(); // calls AnimationMode.StopAnimationMode()
+            OnPreviewChanged?.Invoke();
+        }
+
+        /// <summary>
+        /// Fully exits AnimationMode (required before writing transforms permanently).
+        /// Returns background entries that were playing so they can be restarted afterwards.
+        /// The active TargetObject is intentionally excluded from the returned list.
+        /// </summary>
+        List<GlobalPlayEntry> PauseAllForApply()
+        {
+            var background = _globalPlayEntries.FindAll(e => e.Go != TargetObject);
+            _globalPlayEntries.Clear();
+            IsPlaying       = false;
+            IsPreviewActive = false;
+            _previewMask    = null;
+            _restPose       = null;
+            if (_globalUpdateRunning)
+            {
+                _globalUpdateRunning = false;
+                EditorApplication.update -= OnEditorUpdate;
+            }
+            PoseSampler.StopPreview(); // AnimationMode.StopAnimationMode()
+            return background;
+        }
+
+        /// <summary>Restarts background playback after a permanent apply operation.</summary>
+        void ResumeBackgroundPlayback(List<GlobalPlayEntry> background)
+        {
+            if (background.Count == 0) return;
+            _globalPlayEntries.AddRange(background);
+            if (!AnimationMode.InAnimationMode())
+                AnimationMode.StartAnimationMode();
+            _lastEditorTime = EditorApplication.timeSinceStartup;
+            if (!_globalUpdateRunning)
+            {
+                _globalUpdateRunning = true;
+                EditorApplication.update += OnEditorUpdate;
+            }
+        }
+
         // ── Playback ──────────────────────────────────────────────────────────
         public void StartPlayback(BoneMask mask = null)
         {
             if (TargetObject == null || SelectedClip == null) return;
 
-            // Preview must be active to show playback in scene
-            if (!IsPreviewActive) StartPreview(mask);
-            else if (mask != null) { _previewMask = mask; }  // update mask on already-active preview
+            // Register (or update) this object in the global playback list
+            _globalPlayEntries.RemoveAll(e => e.Go == TargetObject);
+            _globalPlayEntries.Add(new GlobalPlayEntry
+            {
+                Go    = TargetObject,
+                Clip  = SelectedClip,
+                Time  = CurrentTime,
+                Speed = PlaybackSpeed
+            });
 
             IsPlaying       = true;
+            IsPreviewActive = true;
+            if (mask != null) _previewMask = mask;
+
+            // Ensure AnimationMode is running
+            if (!AnimationMode.InAnimationMode())
+                AnimationMode.StartAnimationMode();
+
+            // Start the global update loop if not already running
             _lastEditorTime = EditorApplication.timeSinceStartup;
-            EditorApplication.update += OnEditorUpdate;
+            if (!_globalUpdateRunning)
+            {
+                _globalUpdateRunning = true;
+                EditorApplication.update += OnEditorUpdate;
+            }
+
             OnPreviewChanged?.Invoke();
         }
 
         public void StopPlayback()
         {
             if (!IsPlaying) return;
+            _globalPlayEntries.RemoveAll(e => e.Go == TargetObject);
             IsPlaying = false;
-            EditorApplication.update -= OnEditorUpdate;
+
+            // Keep the update loop alive if:
+            //   • other background objects are still playing, OR
+            //   • the active target is in scrubbing-only preview (holds the last frame)
+            if (_globalPlayEntries.Count == 0 && !IsPreviewActive && _globalUpdateRunning)
+            {
+                _globalUpdateRunning = false;
+                EditorApplication.update -= OnEditorUpdate;
+            }
+
             OnPreviewChanged?.Invoke();
         }
 
@@ -152,24 +427,50 @@ namespace SnapPose.Editor
 
         void OnEditorUpdate()
         {
-            if (!IsPlaying || SelectedClip == null || TargetObject == null)
+            bool hasPlayingEntries = _globalPlayEntries.Count > 0;
+            bool hasScrubbing      = IsPreviewActive && !IsPlaying
+                                     && TargetObject != null && SelectedClip != null;
+
+            // Nothing to do — shut the loop down
+            if (!hasPlayingEntries && !hasScrubbing)
             {
-                StopPlayback();
+                _globalUpdateRunning = false;
+                EditorApplication.update -= OnEditorUpdate;
                 return;
             }
 
-            double now   = EditorApplication.timeSinceStartup;
-            float  delta = (float)(now - _lastEditorTime) * PlaybackSpeed;
+            var   now   = EditorApplication.timeSinceStartup;
+            float delta = (float)(now - _lastEditorTime);
             _lastEditorTime = now;
 
-            float next = CurrentTime + delta;
+            if (!AnimationMode.InAnimationMode())
+                AnimationMode.StartAnimationMode();
 
-            // Loop
-            if (next >= SelectedClip.length)
-                next = next % SelectedClip.length;
+            // Remove entries whose GameObjects were destroyed in the scene
+            _globalPlayEntries.RemoveAll(e => e.Go == null);
 
-            CurrentTime = next;
-            RefreshPreview();   // mask-aware refresh
+            // Sample ALL playing objects AND the scrubbing target in one AnimationMode batch.
+            // Including the scrubbing target here prevents BeginSampling from clearing its pose
+            // when background objects are animating.
+
+            AnimationMode.BeginSampling();
+            foreach (var entry in _globalPlayEntries)
+            {
+                entry.Time += delta * entry.Speed;
+                if (entry.Time >= entry.Clip.length)
+                    entry.Time = entry.Time % entry.Clip.length;
+                AnimationMode.SampleAnimationClip(entry.Go, entry.Clip, entry.Time);
+            }
+            if (hasScrubbing)
+                AnimationMode.SampleAnimationClip(TargetObject, SelectedClip, CurrentTime);
+            AnimationMode.EndSampling();
+
+            // Keep CurrentTime in sync for the active target when it is playing
+            var activeEntry = _globalPlayEntries.Find(e => e.Go == TargetObject);
+            if (activeEntry != null)
+                CurrentTime = activeEntry.Time;
+
+            SceneView.RepaintAll();
             OnPreviewChanged?.Invoke();
         }
 
@@ -195,8 +496,12 @@ namespace SnapPose.Editor
             var pose = SampleCurrentPose(mask);
             if (pose == null) return;
 
-            StopPreview();
+            // Fully stop AnimationMode before writing transforms permanently.
+            // AnimationMode.BeginSampling() resets all previously-driven values on every frame,
+            // which would silently undo any transform writes made while AnimationMode is active.
+            var background = PauseAllForApply();
             PoseApplicator.Apply(TargetObject, pose, mask, blendWeight, mode);
+            ResumeBackgroundPlayback(background);
 
             AddHistory(new HistoryEntry
             {
@@ -231,8 +536,9 @@ namespace SnapPose.Editor
         public void ApplyStack(ApplyMode mode)
         {
             if (TargetObject == null) return;
-            StopPreview();
+            var background = PauseAllForApply();
             PoseApplicator.ApplyStack(TargetObject, PoseStack, mode);
+            ResumeBackgroundPlayback(background);
             NotifyStateChanged();
         }
 

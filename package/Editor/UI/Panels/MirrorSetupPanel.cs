@@ -14,8 +14,9 @@ namespace SnapPose.Editor.UI
         readonly SnapPoseController _ctrl;
 
         // State
-        BoneMirrorMap           _map  = new BoneMirrorMap();
-        PoseApplicator.MirrorAxis _axis = PoseApplicator.MirrorAxis.X;
+        BoneMirrorMap             _map        = new BoneMirrorMap();
+        PoseApplicator.MirrorAxis _axis       = PoseApplicator.MirrorAxis.X;
+        GameObject                _lastTarget;
 
         // UI
         VisualElement _pairList;
@@ -235,16 +236,16 @@ namespace SnapPose.Editor.UI
         // ── State ─────────────────────────────────────────────────────────────
         void OnStateChanged()
         {
-            RefreshApplyButton();
-
-            // If target changed, clear stale pairs
-            if (_ctrl.TargetObject == null)
+            var newTarget = _ctrl.TargetObject;
+            if (newTarget != _lastTarget)
             {
+                _lastTarget = newTarget;
                 _map = new BoneMirrorMap();
                 _pairList.Clear();
                 _statusLabel.text  = "Click 'Auto-Detect Pairs' to find L/R bone pairs.";
                 _statusLabel.style.color = new StyleColor(SnapPoseStyles.TextSecondary);
             }
+            RefreshApplyButton();
         }
 
         void RefreshApplyButton()
